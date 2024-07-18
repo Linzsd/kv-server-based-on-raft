@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 3D:
 	SnapshotValid bool
@@ -52,6 +54,7 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Term    int
 	Command interface{}
+	Index   int // 日志索引
 }
 
 const (
@@ -95,6 +98,11 @@ type Raft struct {
 	role           Role
 	electionTimer  *time.Ticker
 	heartBeatTimer *time.Ticker
+
+	applyChan    chan ApplyMsg
+	applyMsgCond *sync.Cond
+	isSnapshot   uint32 // 是否正在保存快照 为了维持日志与快照顺序一致
+	isAppendLog  uint32 // 是否正在加入日志到applychan
 }
 
 // return currentTerm and whether this server
@@ -111,23 +119,28 @@ func (rf *Raft) GetState() (int, bool) {
 
 func (rf *Raft) changeState(role Role) {
 	if role == Follower {
-		DPrintf("{Server %v} Term %v, %v ==> Follower\n", rf.me, rf.currentTerm, rf.role)
+		DPrintf("{Server %v} Term [%v], %v ==> Follower\n", rf.me, rf.currentTerm, rf.role)
 		rf.resetElectionTimeout()
 		rf.heartBeatTimer.Stop()
 	} else if role == Leader {
-		DPrintf("{Server %v} Term %v, %v ==> Leader\n", rf.me, rf.currentTerm, rf.role)
+		DPrintf("{Server %v} Term [%v], %v ==> Leader\n", rf.me, rf.currentTerm, rf.role)
+		lastLog := rf.getLastLog()
+		for i := 0; i < len(rf.peers); i++ {
+			rf.matchIndex[i], rf.nextIndex[i] = 0, lastLog.Index+1
+		}
 		rf.electionTimer.Stop()
 		rf.heartBeatTimer.Reset(HEARTBEAT)
 	}
 	rf.role = role
 }
 
-func (rf *Raft) getLastLog() LogEntry {
-	return rf.log[len(rf.log)-1]
+// 与快照相关，用了快照后，日志索引就不是rf.log[]的索引了
+func (rf *Raft) getFirstLog() LogEntry {
+	return rf.log[0]
 }
 
-func (rf *Raft) getLastLogIndex() int {
-	return len(rf.log) - 1
+func (rf *Raft) getLastLog() LogEntry {
+	return rf.log[len(rf.log)-1]
 }
 
 // save Raft's persistent state to stable storage,
@@ -201,7 +214,7 @@ func (rf *Raft) genRequestVoteArgs() RequestVoteArgs {
 	return RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.getLastLogIndex(),
+		LastLogIndex: rf.getLastLog().Index,
 		LastLogTerm:  rf.getLastLog().Term,
 	}
 }
@@ -229,13 +242,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// 还未投票 或者 可能重传rpc
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		DPrintf("{Server %v} Term %v vote for %d.\n", rf.me, rf.currentTerm, args.CandidateId)
-		rf.votedFor = args.CandidateId // 给候选人投票
-		reply.VoteGranted = true
+		// 2B限制：日志需要是最新的
+		if rf.isLogMatch(args.LastLogIndex, args.LastLogTerm) {
+			DPrintf("{Server %v} Term [%v] vote for %d.\n", rf.me, rf.currentTerm, args.CandidateId)
+			rf.changeState(Follower)
+			rf.votedFor = args.CandidateId // 给候选人投票
+			reply.VoteGranted = true
+		} else {
+			reply.VoteGranted = false
+		}
 	} else {
 		reply.VoteGranted = false
 	}
 	reply.Term = rf.currentTerm
+}
+
+// 论文原话：通过⽐较两份日志中最后⼀条日志条目的索引值和任期号定义谁的日志⽐较新。如果两份
+// 日志最后的条⽬的任期号不同，那么任期号⼤的⽇志更加新。如果两份⽇志最后的条⽬任期号
+// 相同，那么⽇志⽐较⻓的那个就更加新
+func (rf *Raft) isLogMatch(lastLogIndex int, lastLogTerm int) bool {
+	lastLog := rf.getLastLog()
+	if lastLogTerm > lastLog.Term || (lastLogTerm == lastLog.Term && lastLogIndex >= lastLog.Index) {
+		return true
+	}
+	return false
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -282,10 +312,65 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XIndex  int
+	XTerm   int
+}
+
+func (rf *Raft) applyMsg() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyMsgCond.Wait()
+		}
+		applyEntries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+		firstIndex := rf.getFirstLog().Index
+		commitIndex := rf.commitIndex
+		copy(applyEntries, rf.log[rf.lastApplied-firstIndex+1:rf.commitIndex-firstIndex+1])
+		if rf.isSnapshot == 1 {
+			rf.isAppendLog = 0
+			rf.mu.Unlock()
+			continue
+		}
+		rf.isAppendLog = 1
+		rf.mu.Unlock()
+		for _, entry := range applyEntries {
+			rf.applyChan <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+				CommandTerm:  entry.Term,
+			}
+		}
+		atomic.StoreUint32(&rf.isAppendLog, 0)
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
+	}
+}
+
+// 裁剪日志 并返回最后一个匹配的索引
+func (rf *Raft) cropLogs(args *AppendEntriesArgs) int {
+	// 得到第一条日志的索引
+	firstIndex := rf.getFirstLog().Index
+	// 遍历新加入的日志
+	for i, entry := range args.Entries {
+		// 一旦新加入日志条目的索引超出了日志队列的范围 那么原队列不需要裁剪 把接收到的日志中不存在的日志添加到本地日志队列
+		// 如果某个新加入的日志对应的任期不等于本地日志对应的任期 那么本地日志从这个位置以及以后的日志全部丢弃
+		if entry.Index >= firstIndex+len(rf.log) || rf.log[entry.Index-firstIndex].Term != entry.Term {
+			var tmp []LogEntry
+			rf.log = append(tmp, rf.log[:entry.Index-firstIndex]...)
+			return i
+		}
+	}
+	// 遍历到这说明所有日志都匹配 可能是接收到了重传的日志队列 那么本地日志队列不需要加入新的日志
+	return len(args.Entries)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// 请求的term小于本节点的term，拒绝请求
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	// 请求的term小于本节点的term，拒绝请求 论文(5.2)
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
@@ -293,12 +378,148 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 请求的term大于等于本节点的term，更新本节点的term
 	rf.changeState(Follower)
 	rf.currentTerm = args.Term
+
+	// 延迟的rpc请求 丢弃
+	if args.PrevLogIndex < rf.getFirstLog().Index {
+		DPrintf("{Server %v} Term [%v] PrevLogIndex=[%d] lastLogIndex=[%d].\n", rf.me, rf.currentTerm, args.PrevLogIndex, rf.getLastLog().Index)
+		reply.Term, reply.Success = 0, false
+		return
+	}
+	// 上一条日志索引对应的日志在本节点不存在，或者，term对不上，拒绝请求
+	if args.PrevLogIndex > rf.getLastLog().Index || rf.log[args.PrevLogIndex-rf.getFirstLog().Index].Term != args.PrevLogTerm {
+		DPrintf("{Server %v} Term [%v] reject append log.\n", rf.me, rf.currentTerm)
+
+		reply.Term, reply.Success = rf.currentTerm, false
+		lastIndex := rf.getLastLog().Index
+		firstIndex := rf.getFirstLog().Index
+		// 按照term回退索引
+		//1. follower中没有args.PrevLogIndex对应的日志，nextIndex回退到刚好匹配的索引
+		if args.PrevLogIndex > lastIndex {
+			reply.XIndex, reply.XTerm = lastIndex+1, -1
+		} else {
+			//2. follower有args.PrevLogIndex对应的日志，那么是term冲突了。
+			//并且返回Xindex指向当前term的第一条索引的前一条索引(快速回退)
+			//因为这个term对不上，这个term期间的日志都没用了
+			reply.XTerm = rf.log[args.PrevLogIndex-firstIndex].Term
+			// leader收到消息后，应该回退到Xindex + 1
+			index := args.PrevLogIndex - 1
+			for index >= firstIndex && rf.log[index-firstIndex].Term == reply.XTerm {
+				index--
+			}
+			reply.XIndex = index
+		}
+		DPrintf("{Server %v} Term [%v] reply = %v.\n", rf.me, rf.currentTerm, *reply)
+		return
+	}
+	// 添加日志
+	DPrintf("{Server %v} Term [%v] start append log.\n", rf.me, rf.currentTerm)
+	firstIndex := rf.cropLogs(args)
+	rf.log = append(rf.log, args.Entries[firstIndex:]...)
+	DPrintf("{Server %v} Term [%v] append log sucess.\n", rf.me, rf.currentTerm)
+	newCommitIndex := min(args.LeaderCommit, rf.getLastLog().Index)
+	if newCommitIndex > rf.commitIndex {
+		DPrintf("{Server %v} Term [%v] commit.\n", rf.me, rf.currentTerm)
+		rf.commitIndex = newCommitIndex
+		// TODO: commit
+		rf.applyMsgCond.Signal()
+	}
 	reply.Term, reply.Success = rf.currentTerm, true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) genAppendEntriesArgs(peer int) *AppendEntriesArgs {
+	firstIndex := rf.getFirstLog().Index
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[peer] - 1,
+		PrevLogTerm:  rf.log[rf.nextIndex[peer]-1-firstIndex].Term,
+		Entries:      cloneLogs(rf.log[rf.nextIndex[peer]-firstIndex:]),
+		LeaderCommit: rf.commitIndex,
+	}
+	return args
+}
+
+func (rf *Raft) sendEntries() {
+	for i := range rf.peers {
+		if rf.me != i {
+			// 并发给每个peer发送心跳
+			go func(peer int) {
+				_, isLeader := rf.GetState()
+				if !isLeader {
+					return
+				}
+				rf.mu.Lock()
+				args := rf.genAppendEntriesArgs(peer)
+				rf.mu.Unlock()
+				reply := &AppendEntriesReply{}
+				DPrintf("{Server %v} Term [%v] Send AppendEntries.\n", rf.me, rf.currentTerm)
+				if rf.sendAppendEntries(peer, args, reply) {
+					rf.mu.Lock()
+					rf.handleAppendEntriesResponse(peer, args, reply)
+					rf.mu.Unlock()
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// 可能期间重新当选了leader，所以判断rf.currentTerm == args.Term
+	if rf.role == Leader && rf.currentTerm == args.Term {
+		//说明leader已经过期
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			rf.changeState(Follower)
+			rf.persist()
+		} else {
+			if reply.Success {
+				rf.matchIndex[peer] = max(rf.matchIndex[peer], args.PrevLogIndex+len(args.Entries))
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				rf.updateLeaderCommitIndex()
+			} else if reply.Term == rf.currentTerm {
+				firstIndex := rf.getFirstLog().Index
+				// leader回退到
+				rf.nextIndex[peer] = max(reply.XIndex, rf.matchIndex[peer]+1)
+				// 是term冲突
+				if reply.Term != -1 {
+					// reply.XIndex是有可能比firstIndex大的
+					// 也就是论文figure 7的其中一种情况
+					boundary := max(firstIndex, reply.XIndex)
+					// 回退，在本地找到与对端节点冲突的term
+					for i := args.PrevLogIndex; i >= boundary; i-- {
+						if rf.log[i-firstIndex].Term == reply.XTerm {
+							rf.nextIndex[peer] = i + 1
+							break
+						}
+					}
+				}
+				DPrintf("{Server %v} Term [%v] update server[%d]'s nextIndex=%d.\n", rf.me, rf.currentTerm, peer, rf.nextIndex[peer])
+			}
+		}
+	}
+}
+
+func (rf *Raft) updateLeaderCommitIndex() {
+	n := len(rf.matchIndex)
+	sortMatchIndex := make([]int, n)
+	copy(sortMatchIndex, rf.matchIndex)
+	sortMatchIndex[rf.me] = rf.getLastLog().Index
+	sort.Ints(sortMatchIndex)
+
+	// rf.me是倒数第一个索引的。
+	newCommitIndex := sortMatchIndex[n/2]
+	if newCommitIndex > rf.commitIndex && newCommitIndex <= rf.getLastLog().Index &&
+		rf.log[newCommitIndex-rf.getFirstLog().Index].Term == rf.currentTerm {
+		DPrintf("{Server %v} Term [%v] update commitIndex[%d] to [%d].\n", rf.me, rf.currentTerm, rf.commitIndex, newCommitIndex)
+		rf.commitIndex = newCommitIndex
+		rf.applyMsgCond.Signal()
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -314,12 +535,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (3B).
-
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return -1, -1, isLeader
+	}
+	DPrintf("{Server %v} Term [%v] receive a command [%v].\n", rf.me, rf.currentTerm, command)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	entry := LogEntry{
+		Term:    term,
+		Command: command,
+		Index:   rf.getLastLog().Index + 1,
+	}
+	rf.log = append(rf.log, entry)
+	index := entry.Index
+	rf.sendEntries()
 	return index, term, isLeader
 }
 
@@ -351,7 +583,7 @@ func (rf *Raft) startElection() {
 
 	args := rf.genRequestVoteArgs()
 	voteCount := 1
-	DPrintf("{Server %v} Term %v ready to send vote request.\n", rf.me, rf.currentTerm)
+	DPrintf("{Server %v} Term [%v] ready to send vote request.\n", rf.me, rf.currentTerm)
 	for i := range rf.peers {
 		if i != rf.me {
 			go func(server int) {
@@ -359,41 +591,25 @@ func (rf *Raft) startElection() {
 				if rf.sendRequestVote(server, &args, &reply) {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
+					// 为什么要确认是否是候选人？因为在等待投票应答时，可能会收到来自更高或相等term的leader的心跳，导致自己变成follower
 					if rf.role == Candidate && reply.VoteGranted {
 						voteCount++
 						// 获得大多数的投票
 						if voteCount > len(rf.peers)/2 {
 							rf.changeState(Leader)
-							DPrintf("{Server %v} Term %v Success become leader.\n",
+							DPrintf("{Server %v} Term [%v] Success become leader.\n",
 								rf.me, rf.currentTerm)
-							rf.startHeartBeat()
+							rf.sendEntries()
 						}
 					} else if reply.Term > rf.currentTerm {
-						// 说明发生了网络分区，旧leader重新加入。
-						DPrintf("{Server %v} Old Term %v discovers a new term %v, convert to follower\n",
+						// 有节点更快的成为了leader，并发送了心跳，导致本节点成为follower
+						DPrintf("{Server %v} Old Term [%v] discovers a new term %v, convert to follower\n",
 							rf.me, rf.currentTerm, reply.Term)
 						rf.currentTerm = reply.Term
+						rf.votedFor = -1
 						rf.changeState(Follower)
+						rf.persist()
 					}
-				}
-			}(i)
-		}
-	}
-}
-
-func (rf *Raft) startHeartBeat() {
-	for i := range rf.peers {
-		if rf.me != i {
-			// 并发给每个peer发送心跳
-			go func(peer int) {
-				term, isLeader := rf.GetState()
-				args := AppendEntriesArgs{Term: term, LeaderId: rf.me}
-				if isLeader {
-					reply := AppendEntriesReply{}
-					DPrintf("{Server %v} Term %v Send AppendEntries.\n", rf.me, rf.currentTerm)
-					rf.sendAppendEntries(peer, &args, &reply)
-				} else {
-					return
 				}
 			}(i)
 		}
@@ -421,14 +637,14 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			rf.changeState(Candidate)
 			rf.resetElectionTimeout()
-			DPrintf("{Server %v} Term %v start election\n", rf.me, rf.currentTerm)
+			DPrintf("{Server %v} Term [%v] start election\n", rf.me, rf.currentTerm)
 			rf.mu.Unlock()
 			rf.startElection()
 		case <-rf.heartBeatTimer.C:
 			rf.mu.Lock()
 			if rf.role == Leader {
-				DPrintf("{Server %v} Term %v send heartbeat\n", rf.me, rf.currentTerm)
-				rf.startHeartBeat()
+				DPrintf("{Server %v} Term [%v] send heartbeat\n", rf.me, rf.currentTerm)
+				rf.sendEntries()
 			}
 			rf.mu.Unlock()
 		}
@@ -468,11 +684,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartBeatTimer = time.NewTicker(HEARTBEAT)
 	rf.heartBeatTimer.Stop()
 
+	rf.applyMsgCond = sync.NewCond(&rf.mu)
+	rf.applyChan = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.getFirstLog().Index
+	rf.commitIndex = rf.getFirstLog().Index
+	lastLog := rf.getLastLog()
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = lastLog.Index + 1
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyMsg()
 
 	return rf
 }
