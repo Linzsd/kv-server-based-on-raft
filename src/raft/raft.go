@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sort"
@@ -150,15 +152,16 @@ func (rf *Raft) getLastLog() LogEntry {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
+func (rf *Raft) persist(snapshot []byte) {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, snapshot)
 }
 
 // restore previously persisted state.
@@ -168,17 +171,18 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []LogEntry
+	var voteFor, currentTerm int
+	if d.Decode(&logs) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil {
+		panic("decode persist state failed!")
+	}
+	rf.log = logs
+	rf.votedFor = voteFor
+	rf.currentTerm = currentTerm
 }
 
 // the service says it has created a snapshot that has
@@ -187,7 +191,6 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
 }
 
 // example RequestVote RPC arguments structure.
@@ -224,6 +227,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist(nil)
 	// 有以下几种情况
 	// term < currentTerm: 对端的term小于自己的term，拒绝请求
 	if args.Term < rf.currentTerm {
@@ -334,6 +338,7 @@ func (rf *Raft) applyMsg() {
 		rf.isAppendLog = 1
 		rf.mu.Unlock()
 		for _, entry := range applyEntries {
+			// 这是给kv层使用的，kv层从chan中取出appylyMsg，然后执行apply
 			rf.applyChan <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
@@ -369,7 +374,7 @@ func (rf *Raft) cropLogs(args *AppendEntriesArgs) int {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
+	defer rf.persist(nil)
 	// 请求的term小于本节点的term，拒绝请求 论文(5.2)
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -420,7 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if newCommitIndex > rf.commitIndex {
 		DPrintf("{Server %v} Term [%v] commit.\n", rf.me, rf.currentTerm)
 		rf.commitIndex = newCommitIndex
-		// TODO: commit
+		// commit
 		rf.applyMsgCond.Signal()
 	}
 	reply.Term, reply.Success = rf.currentTerm, true
@@ -465,6 +470,7 @@ func (rf *Raft) sendEntries() {
 				}
 			}(i)
 		}
+		// leader回退到
 	}
 }
 
@@ -476,7 +482,7 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, r
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.changeState(Follower)
-			rf.persist()
+			rf.persist(nil)
 		} else {
 			if reply.Success {
 				rf.matchIndex[peer] = max(rf.matchIndex[peer], args.PrevLogIndex+len(args.Entries))
@@ -484,7 +490,6 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, args *AppendEntriesArgs, r
 				rf.updateLeaderCommitIndex()
 			} else if reply.Term == rf.currentTerm {
 				firstIndex := rf.getFirstLog().Index
-				// leader回退到
 				rf.nextIndex[peer] = max(reply.XIndex, rf.matchIndex[peer]+1)
 				// 是term冲突
 				if reply.Term != -1 {
@@ -512,7 +517,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	sortMatchIndex[rf.me] = rf.getLastLog().Index
 	sort.Ints(sortMatchIndex)
 
-	// rf.me是倒数第一个索引的。
+	// 排序后从小到大，直接找中间的节点的commitIndex，来确认是否日志被复制到大多数，即可以提交。
 	newCommitIndex := sortMatchIndex[n/2]
 	if newCommitIndex > rf.commitIndex && newCommitIndex <= rf.getLastLog().Index &&
 		rf.log[newCommitIndex-rf.getFirstLog().Index].Term == rf.currentTerm {
@@ -550,6 +555,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   rf.getLastLog().Index + 1,
 	}
 	rf.log = append(rf.log, entry)
+	rf.persist(nil)
 	index := entry.Index
 	rf.sendEntries()
 	return index, term, isLeader
@@ -580,7 +586,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
-
+	rf.persist(nil)
 	args := rf.genRequestVoteArgs()
 	voteCount := 1
 	DPrintf("{Server %v} Term [%v] ready to send vote request.\n", rf.me, rf.currentTerm)
@@ -608,7 +614,7 @@ func (rf *Raft) startElection() {
 						rf.currentTerm = reply.Term
 						rf.votedFor = -1
 						rf.changeState(Follower)
-						rf.persist()
+						rf.persist(nil)
 					}
 				}
 			}(i)
@@ -671,7 +677,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []LogEntry{{Term: 0}}
+	rf.log = make([]LogEntry, 1)
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
