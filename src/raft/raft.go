@@ -262,12 +262,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.log[0].Command = nil
 	rf.persist(args.Snapshot)
 	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
-	rf.isSnapshot = 1
+	atomic.StoreUint32(&rf.isSnapshot, 1)
 	rf.mu.Unlock()
 	for atomic.LoadUint32(&rf.isAppendLog) == 1 {
 		time.Sleep(10 * time.Millisecond)
 	}
+	rf.mu.Lock()
 	DPrintf("{Server %v} Term [%v] start append snapshot.\n", rf.me, rf.currentTerm)
+	rf.mu.Unlock()
 	rf.applyChan <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Snapshot,
@@ -275,7 +277,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.LastIncludedIndex,
 	}
 	atomic.StoreUint32(&rf.isSnapshot, 0)
+	rf.mu.Lock()
 	DPrintf("{Server %v} Term [%v] end append snapshot.\n", rf.me, rf.currentTerm)
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -420,12 +424,12 @@ func (rf *Raft) applyMsg() {
 		firstIndex := rf.getFirstLog().Index
 		commitIndex := rf.commitIndex
 		copy(applyEntries, rf.log[rf.lastApplied-firstIndex+1:rf.commitIndex-firstIndex+1])
-		if rf.isSnapshot == 1 {
-			rf.isAppendLog = 0
+		if atomic.LoadUint32(&rf.isSnapshot) == 1 {
+			atomic.StoreUint32(&rf.isAppendLog, 0)
 			rf.mu.Unlock()
 			continue
 		}
-		rf.isAppendLog = 1
+		atomic.StoreUint32(&rf.isAppendLog, 1)
 		rf.mu.Unlock()
 		for _, entry := range applyEntries {
 			// 这是给kv层使用的，kv层从chan中取出appylyMsg，然后执行apply
@@ -572,9 +576,9 @@ func (rf *Raft) sendEntries() {
 					}
 				} else {
 					args := rf.genAppendEntriesArgs(peer)
-					rf.mu.Unlock()
 					reply := &AppendEntriesReply{}
 					DPrintf("{Server %v} Term [%v] Send AppendEntries.\n", rf.me, rf.currentTerm)
+					rf.mu.Unlock()
 					if rf.sendAppendEntries(peer, args, reply) {
 						rf.mu.Lock()
 						rf.handleAppendEntriesResponse(peer, args, reply)
@@ -674,8 +678,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, isLeader
 	}
-	DPrintf("{Server %v} Term [%v] receive a command [%v].\n", rf.me, rf.currentTerm, command)
 	rf.mu.Lock()
+	DPrintf("{Server %v} Term [%v] receive a command [%v].\n", rf.me, rf.currentTerm, command)
 	defer rf.mu.Unlock()
 	entry := LogEntry{
 		Term:    term,
@@ -717,7 +721,9 @@ func (rf *Raft) startElection() {
 	rf.persist(rf.persister.ReadSnapshot())
 	args := rf.genRequestVoteArgs()
 	voteCount := 1
+	rf.mu.Lock()
 	DPrintf("{Server %v} Term [%v] ready to send vote request.\n", rf.me, rf.currentTerm)
+	rf.mu.Unlock()
 	for i := range rf.peers {
 		if i != rf.me {
 			go func(server int) {

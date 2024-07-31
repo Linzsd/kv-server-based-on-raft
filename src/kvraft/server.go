@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,9 @@ type KVServer struct {
 	stateMachine   *MemoryKV                 // 状态机，存储kv
 	notifyChanMap  map[int]chan *CommonReply // 用于通知的chan, key = index val = chan
 	lastRequestMap map[int64]ReplyContext    // 缓存每个客户端对应的最近请求和reply key = clientId
+	// 3B
+	persist     *raft.Persister
+	lastApplied int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -132,6 +136,36 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 }
 
+// 恢复
+func (kv *KVServer) restoreSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	buffer := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(buffer)
+
+	var stateMachine MemoryKV
+	var lastRequestMap map[int64]ReplyContext
+
+	if decoder.Decode(&stateMachine) != nil ||
+		decoder.Decode(&lastRequestMap) != nil {
+		panic("decode snapshot failed!")
+	}
+	kv.stateMachine = &stateMachine
+	kv.lastRequestMap = lastRequestMap
+}
+
+func (kv *KVServer) getSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	// 这个也需要持久化，因为服务端崩溃重启 客户端可能还没有感知到，当做超时，重传了 如果这个不保存 那么会出现重复命令的可能
+	e.Encode(kv.lastRequestMap)
+	kvstate := w.Bytes()
+	return kvstate
+}
+
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -180,6 +214,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.stateMachine = &MemoryKV{make(map[string]string)}
 	kv.notifyChanMap = make(map[int]chan *CommonReply)
 	kv.lastRequestMap = make(map[int64]ReplyContext)
+	kv.persist = persister
+	// 可能是宕机重启，读快照快速恢复
+	kv.restoreSnapshot(persister.ReadSnapshot())
+
 	go kv.applier()
 	DPrintf("server{%d}: start", kv.me)
 	return kv
@@ -192,14 +230,40 @@ func (kv *KVServer) applier() {
 			DPrintf("server{%d}: receive applyMsg = %v", kv.me, applyMsg)
 			kv.mu.Lock()
 			if applyMsg.CommandValid {
+				// 假设本节点因为网络原因落后于其他的节点 其他节点到日志条目数为n1时做了一个快照 同时这个节点是leader节点
+				// 本节点请求日志的时候发现leader节点没有需要的日志（变成快照后删除了） 因此leader节点发送快照给本节点
+				// 如果有快照的时候会读取快照 这个时候如果leader中没有保存快照直接把日志发送过来的话 直接返回即可不需要应用
+				//if applyMsg.CommandIndex <= kv.lastApplied {
+				//	DPrintf("server{%d}: outdate applyMsg, commandIndex=%d, lastApplied=%d",
+				//		kv.me, applyMsg.CommandIndex, kv.lastApplied)
+				//	kv.mu.Unlock()
+				//	continue
+				//}
 				reply := kv.apply(applyMsg.Command)
-
+				kv.mu.Unlock()
 				currentTerm, isLeader := kv.rf.GetState()
 				// 如果不是leader，或者是分区的旧leader，就不用给client应答
+				kv.mu.Lock()
 				if isLeader && applyMsg.CommandTerm == currentTerm {
 					kv.notify(applyMsg.CommandIndex, reply)
 				}
 
+				if kv.maxraftstate != -1 && kv.persist.RaftStateSize() > kv.maxraftstate {
+					DPrintf("server{%d}: get snapshot index = %d, maxraftstate = %d, raftStateSize = %d",
+						kv.me, applyMsg.CommandIndex, kv.maxraftstate, kv.persist.RaftStateSize())
+					kv.rf.Snapshot(applyMsg.CommandIndex, kv.getSnapshot())
+				}
+				kv.lastApplied = applyMsg.CommandIndex
+			} else if applyMsg.SnapshotValid {
+				//if applyMsg.SnapshotIndex <= kv.lastApplied {
+				//	DPrintf("server{%d}: drop snapshot index = %d, lastApplied=%d",
+				//		kv.me, applyMsg.SnapshotIndex, kv.lastApplied)
+				//	kv.mu.Unlock()
+				//	continue
+				//}
+				DPrintf("server{%d}: restore snapshot index = %d", kv.me, applyMsg.SnapshotIndex)
+				kv.restoreSnapshot(applyMsg.Snapshot)
+				kv.lastApplied = applyMsg.SnapshotIndex
 			} else {
 				panic("wrong applyMsg")
 			}
