@@ -105,3 +105,5 @@ func (ck *Clerk) Move(shard int, gid int) {
 		return
 	}
 }
+
+//

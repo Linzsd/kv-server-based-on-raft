@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -201,6 +201,16 @@ func getMinShardGroup(group2shard map[int][]int) int {
 			minNum, minGid = tmp, gid
 		}
 	}
+	// 如果len(v)是相同的，min则不起作用，这时return的minGid由遍历顺序决定。
+	//for k, v := range group2shard {
+	//	if k == 0 {
+	//		continue
+	//	}
+	//	tmp := min(minNum, len(v))
+	//	if tmp < minNum {
+	//		minNum, minGid = tmp, k
+	//	}
+	//}
 
 	return minGid
 }
@@ -225,6 +235,15 @@ func getMaxShardGroup(group2shard map[int][]int) int {
 			maxNum, maxGid = tmp, gid
 		}
 	}
+	//for k, v := range group2shard {
+	//	if k == 0 && len(v) > 0 {
+	//		return 0
+	//	}
+	//	tmp := max(maxNum, len(v))
+	//	if tmp > maxNum {
+	//		maxNum, maxGid = tmp, k
+	//	}
+	//}
 
 	return maxGid
 }
